@@ -404,6 +404,12 @@ class NVKIface:
     if self.device_id >= len(NVKIface.gpus_info) or not NVKIface.gpus_info[self.device_id].valid:
       raise RuntimeError(f"No device found for {device_id}. Requesting more devices than the system has?")
 
+    # Track UVM registrations so device_fini() can tear them down on process exit. Without this, the kernel/DriverKit
+    # holds PTE mappings for this process until reboot, causing a second tinygrad init to hang or hit "PTE already mapped".
+    self._uvm_channels: list[int] = []
+    self._uvm_vaspace_registered = False
+    self._uvm_gpu_registered = False
+
     self.fd_dev = self._new_gpu_fd()
     self.gpu_info = self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2,
       nv_gpu.NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS(gpuId=NVKIface.gpus_info[self.device_id].gpu_id))
@@ -448,8 +454,10 @@ class NVKIface:
     self.gpu_uuid = nv_gpu.struct_nv_uuid(uuid=(ctypes.c_ubyte*16)(*[raw_uuid.data[i] for i in range(16)]))
 
     self.uvm(nv_gpu.UVM_REGISTER_GPU, nv_gpu.UVM_REGISTER_GPU_PARAMS(rmCtrlFd=-1, gpu_uuid=self.gpu_uuid))
+    self._uvm_gpu_registered = True
     self.uvm(nv_gpu.UVM_REGISTER_GPU_VASPACE, nv_gpu.UVM_REGISTER_GPU_VASPACE_PARAMS(
       gpuUuid=self.gpu_uuid, rmCtrlFd=self.fd_ctl.fd, hClient=self.root, hVaSpace=vaspace))
+    self._uvm_vaspace_registered = True
 
     for dev in cast(list[NVDevice], [d for pg in HCQCompiled.peer_groups.values() for d in pg if isinstance(d, NVDevice) and not d.is_nvd()]):
       try: self.uvm(nv_gpu.UVM_ENABLE_PEER_ACCESS, nv_gpu.UVM_ENABLE_PEER_ACCESS_PARAMS(gpuUuidA=self.gpu_uuid, gpuUuidB=dev.iface.gpu_uuid))
@@ -458,6 +466,7 @@ class NVKIface:
   def setup_gpfifo_vm(self, gpfifo):
     self.uvm(nv_gpu.UVM_REGISTER_CHANNEL, nv_gpu.UVM_REGISTER_CHANNEL_PARAMS(gpuUuid=self.gpu_uuid, rmCtrlFd=self.fd_ctl.fd, hClient=self.root,
       hChannel=gpfifo, base=self._alloc_gpu_vaddr(0x4000000, force_low=True), length=0x4000000))
+    self._uvm_channels.append(gpfifo)
 
   def _new_gpu_fd(self):
     fd_dev = FileIOInterface(f"/dev/nvidia{NVKIface.gpus_info[self.device_id].minor_number}", os.O_RDWR | os.O_CLOEXEC)
@@ -549,6 +558,27 @@ class NVKIface:
     return NVKIface.low_uvm_vaddr_allocator.alloc(size, alignment) if force_low else NVKIface.uvm_vaddr_allocator.alloc(size, alignment)
 
   def sleep(self, tm:int): pass
+
+  def device_fini(self):
+    # Best-effort teardown of UVM state created by this iface. The kernel/DriverKit holds PTE mappings for as long as
+    # this process has them registered; without an explicit unregister chain those mappings persist past process exit
+    # (NVDevice has no __del__), and a second tinygrad init in the same boot session hangs at NV init or fails with
+    # "PTE already mapped". Order is the reverse of registration in setup_vm / setup_gpfifo_vm.
+    for hChannel in reversed(self._uvm_channels):
+      with contextlib.suppress(Exception):
+        self.uvm(nv_gpu.UVM_UNREGISTER_CHANNEL,
+                 nv_gpu.UVM_UNREGISTER_CHANNEL_PARAMS(gpuUuid=self.gpu_uuid, hClient=self.root, hChannel=hChannel))
+    self._uvm_channels.clear()
+
+    if self._uvm_vaspace_registered:
+      with contextlib.suppress(Exception):
+        self.uvm(nv_gpu.UVM_UNREGISTER_GPU_VASPACE, nv_gpu.UVM_UNREGISTER_GPU_VASPACE_PARAMS(gpuUuid=self.gpu_uuid))
+      self._uvm_vaspace_registered = False
+
+    if self._uvm_gpu_registered:
+      with contextlib.suppress(Exception):
+        self.uvm(nv_gpu.UVM_UNREGISTER_GPU, nv_gpu.UVM_UNREGISTER_GPU_PARAMS(gpu_uuid=self.gpu_uuid))
+      self._uvm_gpu_registered = False
 
 class PCIIface(PCIIfaceBase):
   def __init__(self, dev, dev_id):
